@@ -1,5 +1,20 @@
 # AMFI NAV Loader - User Guide
 
+## License
+This software is licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Copyright 2025
+
 This guide explains how to use the script to download and process mutual fund NAV (Net Asset Value) data from the AMFI India portal.
 
 ## Prerequisites
@@ -12,8 +27,8 @@ This guide explains how to use the script to download and process mutual fund NA
 
 1. Clone the repository:
 ```bash
-git clone <repository-url>
-cd <repository-directory>
+git clone https://github.com/ukkit/nav_loader
+cd nav_loader
 ```
 
 2. Install required packages:
@@ -40,7 +55,7 @@ Create the database and table using the provided schema.sql file:
 mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS enterprise;"
 
 # Import the schema
-mysql -u root -p dont_worry < schema.sql
+mysql -u root -p enterprise < schema.sql
 ```
 
 The schema creates a partitioned table with the following structure:
