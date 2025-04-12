@@ -40,12 +40,13 @@ class NAVLoader:
     RETRY_DELAY = 10  # Delay between retries in seconds
     NAVALL_BASE_URL = "https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx?frmdt={}&todt={}"
     
-    def __init__(self, db_config: dict = None):
+    def __init__(self, db_config: dict = None, telegram_config: dict = None):
         """
-        Initialize the NAVLoader with database configuration.
+        Initialize the NAVLoader with database and notification configuration.
         
         Args:
             db_config (dict): Database configuration dictionary
+            telegram_config (dict): Telegram configuration dictionary
         """
         self.db_config = db_config or {
             'host': os.getenv('MYSQL_HOST', 'mysqldb'),
@@ -53,6 +54,11 @@ class NAVLoader:
             'password': os.getenv('MYSQL_PASSWORD', 'marley'),
             'database': os.getenv('MYSQL_DATABASE', 'dont_worry'),
             'port': int(os.getenv('MYSQL_PORT', 3306))
+        }
+        
+        self.telegram_config = telegram_config or {
+            'bot_token': os.getenv('TELEGRAM_BOT_TOKEN', ''),
+            'chat_id': os.getenv('TELEGRAM_CHAT_ID', '')
         }
         
         # Initialize Indian holidays
@@ -87,9 +93,73 @@ class NAVLoader:
             date -= timedelta(days=1)
         return date
     
+    def check_data_exists_in_db(self, date: datetime) -> bool:
+        """
+        Check if data exists in the database for a specific date.
+        
+        Args:
+            date (datetime): Date to check
+            
+        Returns:
+            bool: True if data exists, False otherwise
+        """
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            query = "SELECT COUNT(*) FROM nav_data WHERE nav_date = %s"
+            cursor.execute(query, (date.date(),))
+            count = cursor.fetchone()[0]
+            return count > 0
+        finally:
+            cursor.close()
+            conn.close()
+
+    def verify_data_completeness(self, date: datetime) -> bool:
+        """
+        Verify if data for a specific date is complete in the database.
+        Checks if the number of records matches expected count.
+        
+        Args:
+            date (datetime): Date to verify
+            
+        Returns:
+            bool: True if data is complete, False otherwise
+        """
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # Get count of records for the date
+            query = "SELECT COUNT(*) FROM nav_data WHERE nav_date = %s"
+            cursor.execute(query, (date.date(),))
+            db_count = cursor.fetchone()[0]
+            
+            # If no records, data is incomplete
+            if db_count == 0:
+                return False
+                
+            # Get count from the local file if it exists
+            file_path = f"data/navall_{date.strftime('%Y-%m-%d')}.txt"
+            if os.path.exists(file_path):
+                df = self.parse_nav_file(file_path)
+                file_count = len(df) if df is not None else 0
+                
+                # If file count is significantly different from db count, data might be incomplete
+                if abs(file_count - db_count) > 5:  # Allow small differences due to data cleaning
+                    self.logger.warning(f"Data completeness mismatch for {date.date()}: "
+                                      f"DB records: {db_count}, File records: {file_count}")
+                    return False
+            
+            return True
+        finally:
+            cursor.close()
+            conn.close()
+
     def download_nav_file_for_date(self, date: datetime) -> str:
         """
         Download NAV file for a specific date with rate limiting and retries.
+        Checks both local file and database existence before downloading.
         
         Args:
             date (datetime): The date for which to download NAV data
@@ -102,13 +172,21 @@ class NAVLoader:
         """
         nav_date = date.strftime('%d-%b-%Y')
         url = self.NAVALL_BASE_URL.format(nav_date, nav_date)
+        file_path = f"data/navall_{date.strftime('%Y-%m-%d')}.txt"
+        
+        # Check if data already exists in database
+        if self.check_data_exists_in_db(date):
+            self.logger.info(f"Data for {date.date()} already exists in database")
+            if os.path.exists(file_path):
+                return file_path
+            # If data exists in DB but file is missing, download to maintain local copy
+            self.logger.info(f"Downloading missing local file for {date.date()}")
         
         for attempt in range(self.MAX_RETRIES):
             try:
                 time.sleep(self.get_random_delay())
                 response = requests.get(url)
                 if response.status_code == 200 and any(char.isdigit() for char in response.text):
-                    file_path = f"data/navall_{date.strftime('%Y-%m-%d')}.txt"
                     os.makedirs("data", exist_ok=True)
                     with open(file_path, "wb") as f:
                         f.write(response.content)
@@ -404,10 +482,120 @@ class NAVLoader:
             
         return True
     
+    def get_incomplete_dates(self, start_date: datetime, end_date: datetime) -> set:
+        """
+        Get all dates with incomplete data in a single database query.
+        
+        Args:
+            start_date (datetime): Start date of the period
+            end_date (datetime): End date of the period
+            
+        Returns:
+            set: Set of dates that need processing
+        """
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            # Convert to date objects if they're datetime
+            start_date = start_date.date() if isinstance(start_date, datetime) else start_date
+            end_date = end_date.date() if isinstance(end_date, datetime) else end_date
+            
+            # Get the oldest date in the database
+            cursor.execute("SELECT MIN(nav_date) FROM nav_data")
+            oldest_db_date = cursor.fetchone()[0]
+            
+            if oldest_db_date is None:
+                # If no data in database, all dates need processing
+                self.logger.info("No data in database. All dates need processing.")
+                return {d.date() for d in pd.date_range(start_date, end_date)}
+            
+            # Get dates with no data at all (before oldest date)
+            missing_dates = set()
+            if start_date < oldest_db_date:
+                # All dates before oldest_db_date need processing
+                missing_dates = {d.date() for d in pd.date_range(start_date, oldest_db_date - timedelta(days=1))}
+                self.logger.info(f"Found {len(missing_dates)} dates before oldest database date {oldest_db_date}")
+            
+            # Get average record count per date for dates after oldest_db_date
+            avg_query = """
+                SELECT AVG(count) 
+                FROM (
+                    SELECT COUNT(*) as count 
+                    FROM nav_data 
+                    WHERE nav_date BETWEEN %s AND %s
+                    GROUP BY nav_date
+                ) as counts
+            """
+            cursor.execute(avg_query, (oldest_db_date, end_date))
+            avg_count = cursor.fetchone()[0] or 0
+            
+            # Get dates with significantly fewer records than average
+            incomplete_query = """
+                SELECT nav_date 
+                FROM nav_data 
+                WHERE nav_date BETWEEN %s AND %s
+                GROUP BY nav_date
+                HAVING COUNT(*) < %s - 5
+            """
+            cursor.execute(incomplete_query, (oldest_db_date, end_date, avg_count))
+            incomplete_dates = {row[0] for row in cursor.fetchall()}
+            
+            # Combine missing and incomplete dates
+            all_dates_to_process = missing_dates.union(incomplete_dates)
+            
+            # Filter out weekends and holidays
+            business_dates_to_process = {
+                d for d in all_dates_to_process 
+                if self.is_business_day(d)
+            }
+            
+            self.logger.info(f"Found {len(business_dates_to_process)} business dates that need processing")
+            return business_dates_to_process
+            
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_date_range_for_period(self, period_days: int, reference_date: datetime = None) -> Tuple[datetime, datetime]:
+        """
+        Get the date range for a specified period, excluding weekends and holidays.
+        
+        Args:
+            period_days (int): Number of days in the period
+            reference_date (datetime): Reference date to start from (default: latest date in database)
+            
+        Returns:
+            Tuple[datetime, datetime]: Start and end dates for the period
+        """
+        if reference_date is None:
+            reference_date = self.get_earliest_nav_date()
+            if reference_date is None:
+                self.logger.info("No existing data in database. Using today as reference.")
+                reference_date = datetime.now()
+            else:
+                self.logger.info(f"Found existing data in database. Oldest date available: {reference_date}")
+        
+        # Convert to date if it's datetime
+        reference_date = reference_date.date() if isinstance(reference_date, datetime) else reference_date
+        
+        # Calculate end date (one day before reference)
+        end_date = reference_date - timedelta(days=1)
+        
+        # Calculate start date
+        start_date = end_date - timedelta(days=period_days)
+        
+        # Adjust start date to skip weekends and holidays
+        while not self.is_business_day(start_date):
+            start_date += timedelta(days=1)
+        
+        self.logger.info(f"Calculated date range: {start_date} to {end_date} (period: {period_days} days)")
+        return start_date, end_date
+
     def bulk_download_past_years(self, years: int = 15) -> List[str]:
         """
         Download NAV data for the specified number of past years.
         Starts from the earliest date in the database and goes back.
+        Uses optimized database queries for better performance.
         
         Args:
             years (int): Number of past years to download data for
@@ -415,44 +603,110 @@ class NAVLoader:
         Returns:
             List[str]: List of downloaded file paths
         """
-        # Get the earliest date from database
-        earliest_date = self.get_earliest_nav_date()
-        if earliest_date is None:
-            self.logger.info("No existing data in database. Starting from today.")
-            end_date = datetime.now()
-        else:
-            self.logger.info(f"Found existing data in database. Starting from {earliest_date}")
-            end_date = earliest_date - timedelta(days=1)
+        start_time = datetime.now()
+        self.logger.info(f"Starting yearly job for {years} years")
         
-        # Calculate start date
-        start_date = end_date - timedelta(days=years*365)
+        # Get date range based on existing data
+        start_date, end_date = self.get_date_range_for_period(years * 365)
+        
+        # Get all dates that need processing in one query
+        dates_to_process = self.get_incomplete_dates(start_date, end_date)
         
         self.logger.info(f"Processing data from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+        self.logger.info(f"Found {len(dates_to_process)} dates that need processing")
+        self.logger.info(f"Dates to process: {sorted(dates_to_process)}")
         
         downloaded_files = []
         current_date = end_date
         
         while current_date >= start_date:
+            current_date_date = current_date.date() if isinstance(current_date, datetime) else current_date
             if self.is_business_day(current_date):
                 file_path = f"data/navall_{current_date.strftime('%Y-%m-%d')}.txt"
-                if not os.path.exists(file_path):
-                    try:
-                        self.logger.info(f"Downloading for {current_date.strftime('%Y-%m-%d')}...")
-                        self.download_nav_file_for_date(current_date)
+                if current_date_date in dates_to_process:
+                    if not os.path.exists(file_path):
+                        try:
+                            self.logger.info(f"Downloading for {current_date.strftime('%Y-%m-%d')} (data incomplete in database)...")
+                            self.download_nav_file_for_date(current_date)
+                            downloaded_files.append(file_path)
+                        except Exception as e:
+                            self.logger.error(f"Failed for {current_date.strftime('%Y-%m-%d')}: {e}")
+                    else:
+                        self.logger.info(f"File exists but data incomplete for {current_date.strftime('%Y-%m-%d')}")
                         downloaded_files.append(file_path)
-                    except Exception as e:
-                        self.logger.error(f"Failed for {current_date.strftime('%Y-%m-%d')}: {e}")
                 else:
-                    self.logger.info(f"File already exists: {file_path}")
-                    downloaded_files.append(file_path)
+                    self.logger.info(f"Data already complete in database for {current_date.strftime('%Y-%m-%d')}")
+            else:
+                self.logger.info(f"Skipping {current_date.strftime('%Y-%m-%d')} (not a business day)")
             
             current_date -= timedelta(days=1)
+        
+        if not downloaded_files:
+            self.logger.warning("No files were downloaded")
+            self.send_telegram_notification(f"<b>Yearly NAV Update</b>\n\nNo files were downloaded for the specified period.")
+            return []
+        
+        self.logger.info(f"Downloaded {len(downloaded_files)} files")
+        
+        success_count = 0
+        failed_count = 0
+        failed_files = []
+        
+        for file_path in downloaded_files:
+            try:
+                self.logger.info(f"Processing file: {file_path}")
+                
+                df = self.parse_nav_file(file_path)
+                if df is None or df.empty:
+                    self.logger.warning(f"No data found in file: {file_path}")
+                    continue
+                
+                csv_path = file_path.replace('.txt', '.csv')
+                df.to_csv(csv_path, index=False)
+                self.logger.info(f"Saved parsed data to: {csv_path}")
+                
+                self.insert_nav(df)
+                success_count += 1
+                self.logger.info(f"Successfully processed: {file_path}")
+                
+            except Exception as e:
+                failed_count += 1
+                failed_files.append(file_path)
+                self.logger.error(f"Error processing {file_path}: {str(e)}")
+        
+        duration = datetime.now() - start_time
+        summary = f"""
+        <b>Yearly NAV Update Summary</b>
+        -----------------------
+        Total files processed: {len(downloaded_files)}
+        Successfully processed: {success_count}
+        Failed to process: {failed_count}
+        Duration: {duration}
+        """
+        
+        if failed_files:
+            summary += "\nFailed files:\n"
+            summary += "\n".join(f"  - {file}" for file in failed_files)
+        
+        self.logger.info(summary)
+        self.send_telegram_notification(summary)
+        
+        # Clean up temporary CSV files
+        try:
+            for file_path in downloaded_files:
+                csv_path = file_path.replace('.txt', '.csv')
+                if os.path.exists(csv_path):
+                    os.remove(csv_path)
+                    self.logger.info(f"Cleaned up temporary file: {csv_path}")
+        except Exception as e:
+            self.logger.error(f"Error cleaning up temporary files: {str(e)}")
         
         return downloaded_files
     
     def bulk_download_past_months(self, months: int = 3, start_date: datetime = None, end_date: datetime = None) -> List[str]:
         """
         Download NAV data for the specified number of past months.
+        Uses optimized database queries for better performance.
         
         Args:
             months (int): Number of past months to download data for
@@ -467,33 +721,77 @@ class NAVLoader:
         if not start_date:
             start_date = end_date - timedelta(days=months*30)
         
+        # Get all dates that need processing in one query
+        dates_to_process = self.get_incomplete_dates(start_date, end_date)
+        
+        self.logger.info(f"Processing data from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+        self.logger.info(f"Found {len(dates_to_process)} dates that need processing")
+        self.logger.info(f"Dates to process: {sorted(dates_to_process)}")
+        
         downloaded_files = []
         os.makedirs("data", exist_ok=True)
         
         current_date = end_date
         while current_date >= start_date:
+            current_date_date = current_date.date() if isinstance(current_date, datetime) else current_date
             if self.is_business_day(current_date):
                 file_path = f"data/navall_{current_date.strftime('%Y-%m-%d')}.txt"
-                
-                if not os.path.exists(file_path):
-                    try:
-                        self.logger.info(f"Downloading NAV data for {current_date.strftime('%Y-%m-%d')}...")
-                        self.download_nav_file_for_date(current_date)
+                if current_date_date in dates_to_process:
+                    if not os.path.exists(file_path):
+                        try:
+                            self.logger.info(f"Downloading NAV data for {current_date.strftime('%Y-%m-%d')} (data incomplete in database)...")
+                            self.download_nav_file_for_date(current_date)
+                            downloaded_files.append(file_path)
+                            self.logger.info(f"Successfully downloaded: {file_path}")
+                        except Exception as e:
+                            self.logger.error(f"Failed to download for {current_date.strftime('%Y-%m-%d')}: {e}")
+                    else:
+                        self.logger.info(f"File exists but data incomplete for {current_date.strftime('%Y-%m-%d')}")
                         downloaded_files.append(file_path)
-                        self.logger.info(f"Successfully downloaded: {file_path}")
-                    except Exception as e:
-                        self.logger.error(f"Failed to download for {current_date.strftime('%Y-%m-%d')}: {e}")
                 else:
-                    self.logger.info(f"File already exists: {file_path}")
-                    downloaded_files.append(file_path)
+                    self.logger.info(f"Data already complete in database for {current_date.strftime('%Y-%m-%d')}")
+            else:
+                self.logger.info(f"Skipping {current_date.strftime('%Y-%m-%d')} (not a business day)")
             
             current_date -= timedelta(days=1)
         
         return downloaded_files
     
+    def send_telegram_notification(self, message: str) -> bool:
+        """
+        Send Telegram notification.
+        
+        Args:
+            message (str): Message to send
+            
+        Returns:
+            bool: True if message was sent successfully, False otherwise
+        """
+        if not all(self.telegram_config.values()):
+            self.logger.warning("Telegram configuration incomplete, skipping notification")
+            return False
+        
+        try:
+            url = f"https://api.telegram.org/bot{self.telegram_config['bot_token']}/sendMessage"
+            data = {
+                "chat_id": self.telegram_config['chat_id'],
+                "text": message,
+                "parse_mode": "HTML"
+            }
+            
+            response = requests.post(url, data=data)
+            response.raise_for_status()
+            
+            self.logger.info("Telegram notification sent successfully")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to send Telegram notification: {e}")
+            return False
+    
     def run_daily_job(self) -> Tuple[int, int, List[str]]:
         """
         Run the daily job to download and process the latest NAV data.
+        Improved to handle both missing files and incomplete database data.
         
         Returns:
             Tuple[int, int, List[str]]: Success count, failure count, and failed dates
@@ -513,14 +811,17 @@ class NAVLoader:
             current_date = latest_db_date + timedelta(days=1)
             while current_date <= yesterday:
                 if current_date.weekday() < 5:  # Only weekdays
-                    missing_days.append(current_date)
+                    # Check if data is complete in database
+                    if not self.verify_data_completeness(current_date):
+                        missing_days.append(current_date)
                 current_date += timedelta(days=1)
             
             if not missing_days:
-                self.logger.info("No missing days found. Database is up to date.")
+                self.logger.info("No missing or incomplete days found. Database is up to date.")
+                self.send_telegram_notification("<b>Daily NAV Update</b>\n\nNo new data to process. Database is up to date.")
                 return 0, 0, []
             
-            self.logger.info(f"Found {len(missing_days)} missing days to process")
+            self.logger.info(f"Found {len(missing_days)} days with missing or incomplete data")
             
             success_count = 0
             failed_count = 0
@@ -531,7 +832,7 @@ class NAVLoader:
                     self.logger.info(f"Processing data for {date.strftime('%Y-%m-%d')}")
                     
                     file_path = f"data/navall_{date.strftime('%Y-%m-%d')}.txt"
-                    if not os.path.exists(file_path):
+                    if not os.path.exists(file_path) or not self.verify_data_completeness(date):
                         self.download_nav_file_for_date(datetime.combine(date, datetime.min.time()))
                     
                     df = self.parse_nav_file(file_path)
@@ -553,20 +854,28 @@ class NAVLoader:
                     self.logger.error(f"Error processing {date.strftime('%Y-%m-%d')}: {str(e)}")
             
             duration = datetime.now() - start_time
-            self.logger.info("\nDaily Job Summary:")
-            self.logger.info(f"Total days processed: {len(missing_days)}")
-            self.logger.info(f"Successfully processed: {success_count}")
-            self.logger.info(f"Failed to process: {failed_count}")
+            summary = f"""
+            <b>Daily NAV Update Summary</b>
+            -----------------------
+            Total days processed: {len(missing_days)}
+            Successfully processed: {success_count}
+            Failed to process: {failed_count}
+            Duration: {duration}
+            """
+            
             if failed_dates:
-                self.logger.info("Failed dates:")
-                for date in failed_dates:
-                    self.logger.info(f"  - {date}")
-            self.logger.info(f"Total duration: {duration}")
+                summary += "\nFailed dates:\n"
+                summary += "\n".join(f"  - {date}" for date in failed_dates)
+            
+            self.logger.info(summary)
+            self.send_telegram_notification(summary)
             
             return success_count, failed_count, failed_dates
             
         except Exception as e:
-            self.logger.error(f"Error in daily job: {str(e)}")
+            error_msg = f"Error in daily job: {str(e)}"
+            self.logger.error(error_msg)
+            self.send_telegram_notification(f"<b>Daily NAV Update Failed</b>\n\n{error_msg}")
             raise
         finally:
             duration = datetime.now() - start_time
@@ -585,110 +894,70 @@ class NAVLoader:
         start_time = datetime.now()
         self.logger.info(f"Starting monthly job for {months} months")
         
+        downloaded_files = []  # Initialize here to ensure it's always defined
         try:
-            earliest_date = self.get_earliest_nav_date()
-            if earliest_date:
-                end_date = earliest_date - timedelta(days=1)
-                start_date = end_date - timedelta(days=months*30)
-                
-                self.logger.info(f"Processing data from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
-                
-                downloaded_files = self.bulk_download_past_months(months, start_date, end_date)
-                if not downloaded_files:
-                    self.logger.warning("No files were downloaded")
-                    return 0, 0, []
-                
-                self.logger.info(f"Downloaded {len(downloaded_files)} files")
-                
-                success_count = 0
-                failed_count = 0
-                failed_files = []
-                
-                for file_path in downloaded_files:
-                    try:
-                        self.logger.info(f"Processing file: {file_path}")
-                        
-                        df = self.parse_nav_file(file_path)
-                        if df is None or df.empty:
-                            self.logger.warning(f"No data found in file: {file_path}")
-                            continue
-                        
-                        csv_path = file_path.replace('.txt', '.csv')
-                        df.to_csv(csv_path, index=False)
-                        self.logger.info(f"Saved parsed data to: {csv_path}")
-                        
-                        self.insert_nav(df)
-                        success_count += 1
-                        self.logger.info(f"Successfully processed: {file_path}")
-                        
-                    except Exception as e:
-                        failed_count += 1
-                        failed_files.append(file_path)
-                        self.logger.error(f"Error processing {file_path}: {str(e)}")
-                
-                duration = datetime.now() - start_time
-                self.logger.info("\nMonthly Job Summary:")
-                self.logger.info(f"Total files processed: {len(downloaded_files)}")
-                self.logger.info(f"Successfully processed: {success_count}")
-                self.logger.info(f"Failed to process: {failed_count}")
-                if failed_files:
-                    self.logger.info("Failed files:")
-                    for file in failed_files:
-                        self.logger.info(f"  - {file}")
-                self.logger.info(f"Total duration: {duration}")
-                
-                return success_count, failed_count, failed_files
-                
-            else:
-                self.logger.info("No existing data in database. Processing default date range.")
-                downloaded_files = self.bulk_download_past_months(months)
-                if not downloaded_files:
-                    self.logger.warning("No files were downloaded")
-                    return 0, 0, []
-                
-                self.logger.info(f"Downloaded {len(downloaded_files)} files")
-                
-                success_count = 0
-                failed_count = 0
-                failed_files = []
-                
-                for file_path in downloaded_files:
-                    try:
-                        self.logger.info(f"Processing file: {file_path}")
-                        
-                        df = self.parse_nav_file(file_path)
-                        if df is None or df.empty:
-                            self.logger.warning(f"No data found in file: {file_path}")
-                            continue
-                        
-                        csv_path = file_path.replace('.txt', '.csv')
-                        df.to_csv(csv_path, index=False)
-                        self.logger.info(f"Saved parsed data to: {csv_path}")
-                        
-                        self.insert_nav(df)
-                        success_count += 1
-                        self.logger.info(f"Successfully processed: {file_path}")
-                        
-                    except Exception as e:
-                        failed_count += 1
-                        failed_files.append(file_path)
-                        self.logger.error(f"Error processing {file_path}: {str(e)}")
-                
-                duration = datetime.now() - start_time
-                self.logger.info("\nMonthly Job Summary:")
-                self.logger.info(f"Total files processed: {len(downloaded_files)}")
-                self.logger.info(f"Successfully processed: {success_count}")
-                self.logger.info(f"Failed to process: {failed_count}")
-                if failed_files:
-                    self.logger.info("Failed files:")
-                    for file in failed_files:
-                        self.logger.info(f"  - {file}")
-                self.logger.info(f"Total duration: {duration}")
-                
-                return success_count, failed_count, failed_files
-                
+            # Get date range based on existing data
+            start_date, end_date = self.get_date_range_for_period(months * 30)
+            
+            self.logger.info(f"Processing data from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+            
+            downloaded_files = self.bulk_download_past_months(months, start_date, end_date)
+            if not downloaded_files:
+                self.logger.warning("No files were downloaded")
+                self.send_telegram_notification(f"<b>Monthly NAV Update</b>\n\nNo files were downloaded for the specified period.")
+                return 0, 0, []
+            
+            self.logger.info(f"Downloaded {len(downloaded_files)} files")
+            
+            success_count = 0
+            failed_count = 0
+            failed_files = []
+            
+            for file_path in downloaded_files:
+                try:
+                    self.logger.info(f"Processing file: {file_path}")
+                    
+                    df = self.parse_nav_file(file_path)
+                    if df is None or df.empty:
+                        self.logger.warning(f"No data found in file: {file_path}")
+                        continue
+                    
+                    csv_path = file_path.replace('.txt', '.csv')
+                    df.to_csv(csv_path, index=False)
+                    self.logger.info(f"Saved parsed data to: {csv_path}")
+                    
+                    self.insert_nav(df)
+                    success_count += 1
+                    self.logger.info(f"Successfully processed: {file_path}")
+                    
+                except Exception as e:
+                    failed_count += 1
+                    failed_files.append(file_path)
+                    self.logger.error(f"Error processing {file_path}: {str(e)}")
+            
+            duration = datetime.now() - start_time
+            summary = f"""
+            <b>Monthly NAV Update Summary</b>
+            -----------------------
+            Total files processed: {len(downloaded_files)}
+            Successfully processed: {success_count}
+            Failed to process: {failed_count}
+            Duration: {duration}
+            """
+            
+            if failed_files:
+                summary += "\nFailed files:\n"
+                summary += "\n".join(f"  - {file}" for file in failed_files)
+            
+            self.logger.info(summary)
+            self.send_telegram_notification(summary)
+            
+            return success_count, failed_count, failed_files
+            
         except Exception as e:
-            self.logger.error(f"Error in monthly job: {str(e)}")
+            error_msg = f"Error in monthly job: {str(e)}"
+            self.logger.error(error_msg)
+            self.send_telegram_notification(f"<b>Monthly NAV Update Failed</b>\n\n{error_msg}")
             raise
         finally:
             try:
@@ -706,10 +975,19 @@ def main():
     parser = argparse.ArgumentParser(description='AMFI NAV Loader - Download and process mutual fund NAV data')
     parser.add_argument('--months', type=int, default=1, help='Number of months to process (for monthly job). Default: 1')
     parser.add_argument('--yearly', type=int, default=1, help='Number of years to process (for yearly job). Default: 1')
+    parser.add_argument('--notify', action='store_true', help='Enable Telegram notifications')
     
     args = parser.parse_args()
     
-    nav_loader = NAVLoader()
+    # Initialize with notification config if enabled
+    telegram_config = None
+    if args.notify:
+        telegram_config = {
+            'bot_token': os.getenv('TELEGRAM_BOT_TOKEN'),
+            'chat_id': os.getenv('TELEGRAM_CHAT_ID')
+        }
+    
+    nav_loader = NAVLoader(telegram_config=telegram_config)
     
     if '--yearly' in sys.argv:
         nav_loader.logger.info(f"Starting yearly job for {args.yearly} years")

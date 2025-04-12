@@ -36,14 +36,18 @@ cd nav_loader
 pip install -r requirements.txt
 ```
 
-3. Set up environment variables (optional):
+3. Set up environment variables in .env file:
 ```bash
-# Database configuration (default values shown)
-export MYSQL_HOST=mysqldb
-export MYSQL_USER=kirk
-export MYSQL_PASSWORD=james
-export MYSQL_DATABASE=enterprise
-export MYSQL_PORT=3306
+# Database Configuration
+MYSQL_HOST=localhost
+MYSQL_USER=your_username
+MYSQL_PASSWORD=your_password
+MYSQL_DATABASE=nav_data
+MYSQL_PORT=3306
+
+# Telegram Configuration (for notifications)
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_chat_id
 ```
 
 ## Database Setup
