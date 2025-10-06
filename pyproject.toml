@@ -1,0 +1,18 @@
+[project]
+name = "nav-loader"
+version = "0.1.0"
+description = "AMFI NAV Loader - Downloads and processes mutual fund NAV data from AMFI India portal"
+requires-python = ">=3.9"
+dependencies = [
+    "requests>=2.31.0",
+    "pandas>=2.2.1",
+    "chardet>=5.2.0",
+    "mysql-connector-python>=8.3.0",
+    "psutil>=5.9.8",
+    "holidays>=0.70",
+    "python-dotenv>=1.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

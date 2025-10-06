@@ -19,9 +19,9 @@ This guide explains how to use the script to download and process mutual fund NA
 
 ## Prerequisites
 
-- Python 3.8 or higher
+- Python 3.9 or higher
 - MySQL database
-- Required Python packages (install using `pip install -r requirements.txt`)
+- Required Python packages (install using `uv sync`)
 
 ## Installation
 
@@ -31,12 +31,20 @@ git clone https://github.com/ukkit/nav_loader
 cd nav_loader
 ```
 
-2. Install required packages:
+2. Create a virtual environment (optional but recommended):
 ```bash
-pip install -r requirements.txt
+uv venv
+source .venv/bin/activate  # On Linux/macOS
+# or
+.venv\Scripts\activate  # On Windows
 ```
 
-3. Set up environment variables in .env file:
+3. Install required packages:
+```bash
+uv sync
+```
+
+4. Set up environment variables in .env file:
 ```bash
 # Database Configuration
 MYSQL_HOST=localhost
@@ -60,6 +68,15 @@ mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS enterprise;"
 
 # Import the schema
 mysql -u root -p enterprise < schema.sql
+
+# Enable MySQL Event Scheduler for automatic partition creation
+mysql -u root -p -e "SET GLOBAL event_scheduler = ON;"
+```
+
+**Note:** To make the Event Scheduler persistent across MySQL restarts, add this to your MySQL configuration file (`my.cnf` or `my.ini`):
+```ini
+[mysqld]
+event_scheduler = ON
 ```
 
 The schema creates a partitioned table with the following structure:
@@ -92,6 +109,7 @@ PARTITION BY RANGE (YEAR(nav_date)) (
 
 Key features of the database design:
 - Partitioned by year for better performance
+- Automatic partition creation for new years via MySQL Event Scheduler
 - Indexed on nav_date and scheme_code
 - Unique constraint on scheme_code and nav_date combination
 - Appropriate data types for each column
@@ -99,7 +117,7 @@ Key features of the database design:
 
 ## Usage
 
-The NAV Loader provides three main modes of operation:
+The NAV Loader provides four main modes of operation:
 
 ### 1. Daily Job
 
@@ -110,10 +128,27 @@ Runs the daily job to download and process the latest NAV data. This mode:
 - Skips weekends and Indian public holidays
 
 ```bash
-python app/nav_loader.py
+uv run nav_loader.py
 ```
 
-### 2. Monthly Job
+### 2. Specific Date Job
+
+Downloads and processes NAV data for a specific date. This mode:
+- Downloads data for the exact date specified
+- Processes and inserts the data into the database
+- Useful for filling specific gaps or reprocessing data
+- Date format: YYYY-MM-DD
+
+```bash
+uv run nav_loader.py --date 2024-01-15
+```
+
+With notifications enabled:
+```bash
+uv run nav_loader.py --date 2024-01-15 --notify
+```
+
+### 3. Monthly Job
 
 Downloads and processes NAV data for a specified number of past months. This mode:
 - Starts from the earliest date in the database
@@ -122,10 +157,10 @@ Downloads and processes NAV data for a specified number of past months. This mod
 - Handles rate limiting and retries
 
 ```bash
-python app/nav_loader.py --months 3
+uv run nav_loader.py --months 3
 ```
 
-### 3. Yearly Job
+### 4. Yearly Job
 
 Downloads and processes NAV data for a specified number of past years. This mode:
 - Starts from the earliest date in the database
@@ -134,7 +169,7 @@ Downloads and processes NAV data for a specified number of past years. This mode
 - Handles rate limiting and retries
 
 ```bash
-python app/nav_loader.py --yearly 5
+uv run nav_loader.py --yearly 5
 ```
 
 ## Configuration

@@ -31,6 +31,10 @@ import mysql.connector
 from datetime import datetime, timedelta, date
 from typing import List, Optional, Tuple
 import holidays
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 class NAVLoader:
     # Configuration constants
@@ -69,6 +73,9 @@ class NAVLoader:
         
     def _setup_logging(self):
         """Configure logging for the NAVLoader."""
+        # Create logs directory if it doesn't exist
+        os.makedirs('logs', exist_ok=True)
+
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
@@ -96,19 +103,21 @@ class NAVLoader:
     def check_data_exists_in_db(self, date: datetime) -> bool:
         """
         Check if data exists in the database for a specific date.
-        
+
         Args:
             date (datetime): Date to check
-            
+
         Returns:
             bool: True if data exists, False otherwise
         """
         conn = self.get_connection()
         cursor = conn.cursor()
-        
+
         try:
+            # Convert to date object if it's a datetime
+            date_obj = date.date() if isinstance(date, datetime) else date
             query = "SELECT COUNT(*) FROM nav_data WHERE nav_date = %s"
-            cursor.execute(query, (date.date(),))
+            cursor.execute(query, (date_obj,))
             count = cursor.fetchone()[0]
             return count > 0
         finally:
@@ -119,38 +128,41 @@ class NAVLoader:
         """
         Verify if data for a specific date is complete in the database.
         Checks if the number of records matches expected count.
-        
+
         Args:
             date (datetime): Date to verify
-            
+
         Returns:
             bool: True if data is complete, False otherwise
         """
         conn = self.get_connection()
         cursor = conn.cursor()
-        
+
         try:
+            # Convert to date object if it's a datetime
+            date_obj = date.date() if isinstance(date, datetime) else date
+
             # Get count of records for the date
             query = "SELECT COUNT(*) FROM nav_data WHERE nav_date = %s"
-            cursor.execute(query, (date.date(),))
+            cursor.execute(query, (date_obj,))
             db_count = cursor.fetchone()[0]
-            
+
             # If no records, data is incomplete
             if db_count == 0:
                 return False
-                
+
             # Get count from the local file if it exists
-            file_path = f"data/navall_{date.strftime('%Y-%m-%d')}.txt"
+            file_path = f"data/navall_{date_obj.strftime('%Y-%m-%d')}.txt"
             if os.path.exists(file_path):
                 df = self.parse_nav_file(file_path)
                 file_count = len(df) if df is not None else 0
-                
+
                 # If file count is significantly different from db count, data might be incomplete
                 if abs(file_count - db_count) > 5:  # Allow small differences due to data cleaning
-                    self.logger.warning(f"Data completeness mismatch for {date.date()}: "
+                    self.logger.warning(f"Data completeness mismatch for {date_obj}: "
                                       f"DB records: {db_count}, File records: {file_count}")
                     return False
-            
+
             return True
         finally:
             cursor.close()
@@ -760,32 +772,36 @@ class NAVLoader:
     def send_telegram_notification(self, message: str) -> bool:
         """
         Send Telegram notification.
-        
+
         Args:
             message (str): Message to send
-            
+
         Returns:
             bool: True if message was sent successfully, False otherwise
         """
-        if not all(self.telegram_config.values()):
-            self.logger.warning("Telegram configuration incomplete, skipping notification")
+        # Check if Telegram config is valid (not empty and not placeholder values)
+        bot_token = self.telegram_config.get('bot_token', '')
+        chat_id = self.telegram_config.get('chat_id', '')
+
+        if not bot_token or not chat_id or bot_token == 'your_bot_token' or chat_id == 'your_chat_id':
+            self.logger.debug("Telegram configuration not set, skipping notification")
             return False
-        
+
         try:
-            url = f"https://api.telegram.org/bot{self.telegram_config['bot_token']}/sendMessage"
+            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
             data = {
-                "chat_id": self.telegram_config['chat_id'],
+                "chat_id": chat_id,
                 "text": message,
                 "parse_mode": "HTML"
             }
-            
+
             response = requests.post(url, data=data)
             response.raise_for_status()
-            
+
             self.logger.info("Telegram notification sent successfully")
             return True
         except Exception as e:
-            self.logger.error(f"Failed to send Telegram notification: {e}")
+            self.logger.debug(f"Telegram notification not sent: {e}")
             return False
     
     def run_daily_job(self) -> Tuple[int, int, List[str]]:
@@ -975,8 +991,9 @@ def main():
     parser = argparse.ArgumentParser(description='AMFI NAV Loader - Download and process mutual fund NAV data')
     parser.add_argument('--months', type=int, default=1, help='Number of months to process (for monthly job). Default: 1')
     parser.add_argument('--yearly', type=int, default=1, help='Number of years to process (for yearly job). Default: 1')
+    parser.add_argument('--date', type=str, help='Specific date to process (format: YYYY-MM-DD)')
     parser.add_argument('--notify', action='store_true', help='Enable Telegram notifications')
-    
+
     args = parser.parse_args()
     
     # Initialize with notification config if enabled
@@ -988,8 +1005,45 @@ def main():
         }
     
     nav_loader = NAVLoader(telegram_config=telegram_config)
-    
-    if '--yearly' in sys.argv:
+
+    if args.date:
+        try:
+            # Parse the date
+            target_date = datetime.strptime(args.date, '%Y-%m-%d')
+            nav_loader.logger.info(f"Processing data for specific date: {args.date}")
+
+            # Download the file
+            file_path = nav_loader.download_nav_file_for_date(target_date)
+
+            # Parse and insert the data
+            df = nav_loader.parse_nav_file(file_path)
+            if df is not None and not df.empty:
+                csv_path = file_path.replace('.txt', '.csv')
+                df.to_csv(csv_path, index=False)
+                nav_loader.logger.info(f"Saved parsed data to: {csv_path}")
+
+                nav_loader.insert_nav(df)
+                nav_loader.logger.info(f"Successfully processed data for {args.date}")
+
+                # Send notification if enabled
+                if args.notify:
+                    nav_loader.send_telegram_notification(
+                        f"<b>NAV Data Processed</b>\n\nSuccessfully processed data for {args.date}"
+                    )
+            else:
+                nav_loader.logger.warning(f"No data found for {args.date}")
+
+        except ValueError as e:
+            nav_loader.logger.error(f"Invalid date format. Please use YYYY-MM-DD. Error: {str(e)}")
+            sys.exit(1)
+        except Exception as e:
+            nav_loader.logger.error(f"Error processing date {args.date}: {str(e)}")
+            if args.notify:
+                nav_loader.send_telegram_notification(
+                    f"<b>NAV Data Processing Failed</b>\n\nFailed to process data for {args.date}\n\nError: {str(e)}"
+                )
+            sys.exit(1)
+    elif '--yearly' in sys.argv:
         nav_loader.logger.info(f"Starting yearly job for {args.yearly} years")
         nav_loader.bulk_download_past_years(args.yearly)
     elif '--months' in sys.argv:

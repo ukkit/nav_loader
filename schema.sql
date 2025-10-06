@@ -54,3 +54,28 @@ PARTITION BY RANGE (YEAR(nav_date)) (
     PARTITION p2024 VALUES LESS THAN (2025),
     PARTITION pmax VALUES LESS THAN MAXVALUE
 );
+
+-- Event to automatically create new partitions each year
+DELIMITER $$
+
+CREATE EVENT IF NOT EXISTS create_yearly_nav_partition
+ON SCHEDULE EVERY 1 YEAR
+STARTS CONCAT(YEAR(CURDATE()) + 1, '-01-01 00:00:00')
+DO
+BEGIN
+    SET @year = YEAR(CURDATE());
+    SET @partition_name = CONCAT('p', @year);
+    SET @next_year = @year + 1;
+
+    SET @sql = CONCAT(
+        'ALTER TABLE nav_data REORGANIZE PARTITION pmax INTO (',
+        'PARTITION ', @partition_name, ' VALUES LESS THAN (', @next_year, '),',
+        'PARTITION pmax VALUES LESS THAN MAXVALUE)'
+    );
+
+    PREPARE stmt FROM @sql;
+    EXECUTE stmt;
+    DEALLOCATE PREPARE stmt;
+END$$
+
+DELIMITER ;
